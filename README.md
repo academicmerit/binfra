@@ -20,6 +20,8 @@ fargate::create-app $APP \
 
 This will get `$APP` exposed to `https://$ENV-$APP.$PROJECT.$COMPANY_DOMAIN_NAME`
 
+## Layers
+
 AWS layers supported at the moment:
 
 ```
