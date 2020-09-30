@@ -63,10 +63,11 @@ snap install --channel=edge shellcheck || {
 "
 ```
 
-Please copy [bin/install](bin/install?raw=true) template to your project
-and tailor it for your needs
-
-Please run `bin/install dev` to install `dev` env of your project into AWS cloud
+Please:
+* Copy [bin/install](bin/install?raw=true) template to your project
+* Update `bin/install` with your project-specific values
+* `chmod a+x bin/install`
+* Run `bin/install dev` to install `dev` environment of your project into AWS cloud
 
 ## Uninstall
 
