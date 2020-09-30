@@ -61,10 +61,10 @@ snap install --channel=edge shellcheck || {
 "
 ```
 
-Please copy [bin/install](https://raw.githubusercontent.com/academicmerit/binfra/dev/bin/install)
-template to your project and tailor it for your needs
+Please copy [bin/install](bin/install?raw=true) template to your project
+and tailor it for your needs
 
-To install `dev` env of your project, run `bin/install dev`
+Please run `bin/install dev` to install `dev` env of your project into AWS cloud
 
 ## Uninstall
 
