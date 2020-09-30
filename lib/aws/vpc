@@ -1,0 +1,486 @@
+#!/bin/bash
+set -euf
+IFS=$'\n\t'
+
+# Functions for AWS Virtual Private Cloud
+# on top of AWS Elastic Compute Cloud
+
+#
+# name tag
+#
+
+function vpc::create-name-tag {
+    # Create name tag for EC2/VPC resource
+    #
+    # Usage: vpc::create-name-tag \
+        local ID=$1
+        local NAME=$2
+
+    echo "Creating name tag of $ID = $NAME..."
+    aws ec2 create-tags \
+        --resources $ID \
+        --tags Key=Name,Value=$NAME
+}
+
+#
+# secgroup
+#
+
+function vpc::create-secgroup {
+    # Create security group (unless it already exists),
+    # put its ID to SSM parameter
+    # and to a variable with the same name
+    #
+    # Usage: vpc::create-secgroup \
+        local SECGROUP_ID_PARAMETER_NAME=$1
+        local SECGROUP_NAME=$2
+        local VPC_ID=$3
+        local INBOUND_RULE=${4-}  # e.g. "--protocol tcp --port 443 --cidr 0.0.0.0/0"
+
+    echo "Reading secgroup $SECGROUP_NAME..."
+    local SECGROUP_ID
+    SECGROUP_ID=$(
+        aws ec2 describe-security-groups \
+            --filters \
+                Name=tag:Name,Values=$SECGROUP_NAME \
+                Name=vpc-id,Values=$VPC_ID \
+            --query SecurityGroups[].GroupId \
+            --output text \
+            2>/dev/null
+    )
+    [[ -z $SECGROUP_ID ]] || {
+        declare -g $SECGROUP_ID_PARAMETER_NAME=$SECGROUP_ID
+        return 0
+    }
+
+    echo "Creating secgroup $SECGROUP_NAME..."
+    SECGROUP_ID=$(
+        aws ec2 create-security-group \
+            --group-name $SECGROUP_NAME \
+            --description "Security group $SECGROUP_NAME" \
+            --vpc-id $VPC_ID \
+            --query GroupId \
+            --output text
+    )
+    [[ -z $SECGROUP_ID ]] && return 1
+    ssm::put $SECGROUP_ID_PARAMETER_NAME $SECGROUP_ID
+    declare -g $SECGROUP_ID_PARAMETER_NAME=$SECGROUP_ID
+    vpc::create-name-tag $SECGROUP_ID $SECGROUP_NAME
+
+    [[ -z $INBOUND_RULE ]] || {
+        echo "Creating inbound rule for $SECGROUP_NAME..."
+        # We need to split $INBOUND_RULE args by spaces too, temporary
+        IFS=$' \n\t'
+        aws ec2 authorize-security-group-ingress \
+            --group-id $SECGROUP_ID \
+            $INBOUND_RULE \
+            >/dev/null
+        IFS=$'\n\t'
+    }
+}
+
+#
+# inbound rule
+#
+
+function vpc::create-inbound-rule-between-secgroups {
+    # Create inbound rule (unless it already exists) in target secgroup
+    # to allow traffic from source secgroup
+    #
+    # Usage: vpc::create-inbound-rule-between-secgroups \
+        local TARGET_SECGROUP_ID=$1
+        local SOURCE_SECGROUP_ID=$2
+        local PORT=$3
+        local PROTOCOL=${4:-tcp}
+
+    echo "Reading inbound rule for port $PORT..."
+    aws ec2 describe-security-groups \
+        --group-ids $TARGET_SECGROUP_ID \
+        --query SecurityGroups[].IpPermissions[].UserIdGroupPairs[].GroupId \
+        --output text \
+        | grep -q $SOURCE_SECGROUP_ID \
+        && return 0
+
+    echo "Creating inbound rule for port $PORT..."
+    aws ec2 authorize-security-group-ingress \
+        --group-id $TARGET_SECGROUP_ID \
+        --source-group $SOURCE_SECGROUP_ID \
+        --port $PORT \
+        --protocol $PROTOCOL \
+        >/dev/null
+}
+
+#
+# route table
+#
+
+function vpc::create-route-table {
+    # Create route table (unless it already exists)
+    # and return its ID via given variable name
+    #
+    # Usage: vpc::create-route-table \
+        local RTB_ID_VAR_NAME=$1
+        local RTB_NAME=$2
+        local VPC_ID=$3
+        local GW_ID=$4
+
+    echo "Reading route table $RTB_NAME..."
+    local RTB_ID
+    RTB_ID=$(
+        aws ec2 describe-route-tables \
+            --filters \
+                Name=tag:Name,Values=$RTB_NAME \
+                Name=vpc-id,Values=$VPC_ID \
+            --query RouteTables[].RouteTableId \
+            --output text
+    )
+    [[ -z $RTB_ID ]] && {
+
+        echo "Creating route table $RTB_NAME..."
+        RTB_ID=$(
+            aws ec2 create-route-table \
+                --vpc-id $VPC_ID \
+                --query RouteTable.RouteTableId \
+                --output text
+        )
+        [[ -z $RTB_ID ]] && return 1
+        vpc::create-name-tag $RTB_ID $RTB_NAME
+
+        while true
+        do
+            echo "Creating default route in $RTB_NAME..."
+            aws ec2 create-route \
+                --route-table-id $RTB_ID \
+                --destination-cidr-block 0.0.0.0/0 \
+                --gateway-id $GW_ID \
+                >/dev/null \
+                && break
+
+            # Sometimes: An error occurred (InvalidGatewayID.NotFound) when calling the
+            # CreateRoute operation: The gateway ID '...' does not exist
+            echo "Waiting for GW..."
+            sleep 3
+        done
+    }
+
+    declare -g $RTB_ID_VAR_NAME=$RTB_ID
+}
+
+#
+# EIP
+#
+
+function vpc::create-eip {
+    # Create Elastic IP (unless it already exists)
+    # and return its allocation ID via given variable name
+    #
+    # Usage: vpc::create-eip \
+        local EIP_ALLOC_ID_VAR_NAME=$1
+        local EIP_NAME=$2
+
+    echo "Reading EIP $EIP_NAME..."
+    local EIP_ALLOC_ID
+    EIP_ALLOC_ID=$(
+        aws ec2 describe-addresses \
+            --filters \
+                Name=tag:Name,Values=$EIP_NAME \
+                Name=domain,Values=vpc \
+            --query Addresses[].AllocationId \
+            --output text
+    )
+    [[ -z $EIP_ALLOC_ID ]] && {
+
+        echo "Creating EIP $EIP_NAME..."
+        EIP_ALLOC_ID=$(
+            aws ec2 allocate-address \
+                --domain vpc \
+                --query AllocationId \
+                --output text
+        )
+        [[ -z $EIP_ALLOC_ID ]] && return 1
+        vpc::create-name-tag $EIP_ALLOC_ID $EIP_NAME
+    }
+
+    declare -g $EIP_ALLOC_ID_VAR_NAME=$EIP_ALLOC_ID
+}
+
+#
+# NAT GW
+#
+
+function vpc::create-nat-gw {
+    # Create NAT gateway (unless it already exists)
+    # and return its ID via given variable name
+    #
+    # Usage: vpc::create-nat-gw \
+        local NAT_GW_ID_VAR_NAME=$1
+        local NAT_GW_NAME=$2
+        local VPC_ID=$3
+        local EIP_ALLOC_ID=$4
+        local PUBLIC_SUBNET_ID=$5
+
+    echo "Reading NAT GW $NAT_GW_NAME..."
+    local NAT_GW_ID
+    NAT_GW_ID=$(
+        aws ec2 describe-nat-gateways \
+            --filter \
+                Name=tag:Name,Values=$NAT_GW_NAME \
+                Name=vpc-id,Values=$VPC_ID \
+            --query NatGateways[].NatGatewayId \
+            --output text
+    )
+    [[ -z $NAT_GW_ID ]] && {
+
+        echo "Creating NAT GW $NAT_GW_NAME..."
+        NAT_GW_ID=$(
+            aws ec2 create-nat-gateway \
+                --allocation-id $EIP_ALLOC_ID \
+                --subnet-id $PUBLIC_SUBNET_ID \
+                --query NatGateway.NatGatewayId \
+                --output text
+        )
+        [[ -z $NAT_GW_ID ]] && return 1
+        vpc::create-name-tag $NAT_GW_ID $NAT_GW_NAME
+    }
+
+    declare -g $NAT_GW_ID_VAR_NAME=$NAT_GW_ID
+}
+
+#
+# IGW
+#
+
+function vpc::create-igw {
+    # Create Internet gateway (unless it already exists),
+    # and return its ID via given variable name
+    #
+    # Usage: vpc::create-igw \
+        local IGW_ID_VAR_NAME=$1
+        local IGW_NAME=$2
+        local VPC_ID=$3
+
+    echo "Reading IGW $IGW_NAME..."
+    local IGW_ID
+    IGW_ID=$(
+        aws ec2 describe-internet-gateways \
+            --filters \
+                Name=tag:Name,Values=$IGW_NAME \
+                Name=attachment.vpc-id,Values=$VPC_ID \
+            --query InternetGateways[].InternetGatewayId \
+            --output text
+    )
+    [[ -z $IGW_ID ]] && {
+
+        echo "Creating IGW $IGW_NAME..."
+        IGW_ID=$(
+            aws ec2 create-internet-gateway \
+                --query InternetGateway.InternetGatewayId \
+                --output text
+        )
+        [[ -z $IGW_ID ]] && return 1
+        vpc::create-name-tag $IGW_ID $IGW_NAME
+
+        echo "Attaching IGW $IGW_NAME to VPC..."
+        aws ec2 attach-internet-gateway \
+            --internet-gateway-id $IGW_ID \
+            --vpc-id $VPC_ID \
+            >/dev/null
+    }
+
+    declare -g $IGW_ID_VAR_NAME=$IGW_ID
+}
+
+#
+# subnet
+#
+
+function vpc::create-subnet {
+    # Create subnet (unless it already exists),
+    # put its ID to SSM parameter
+    # and to a variable with the same name
+    #
+    # Usage: vpc::create-subnet \
+        local SUBNET_ID_PARAMETER_NAME=$1
+        local VPC_ID=$2
+        local VPC_NAME=$3
+        local ACCESS=$4  # "private" or "public"
+        local AZ_LETTER=$5  # "a", "b",..
+        local CIDR_BLOCK=$6
+        local PUBLIC_ID=$7
+            # PUBLIC_ID is ID of public subnet in the same AZ if ACCESS=private
+            #   (because private subnets need access to Internet to pull images)
+            # PUBLIC_ID is ID of public route table if ACCESS=public
+
+    #
+    # PUBLIC_ID vs ACCESS
+    #
+
+    if [[ $ACCESS == private ]]
+    then local PUBLIC_SUBNET_ID=$PUBLIC_ID
+
+    elif [[ $ACCESS == public ]]
+    then local PUBLIC_RTB_ID=$PUBLIC_ID
+
+    else
+        echo 'ACCESS should be either "private" or "public", not "'$ACCESS'"'
+        exit 1
+    fi
+
+    #
+    # subnet
+    #
+
+    local SUBNET_NAME=$VPC_NAME-$ACCESS-$AZ_LETTER
+
+    echo "Reading subnet $SUBNET_NAME..."
+    local SUBNET_ID
+    SUBNET_ID=$(
+        aws ec2 describe-subnets \
+            --filters \
+                Name=tag:Name,Values=$SUBNET_NAME \
+                Name=vpc-id,Values=$VPC_ID \
+            --query Subnets[].SubnetId \
+            --output text
+    )
+    [[ -z $SUBNET_ID ]] || {
+        declare -g $SUBNET_ID_PARAMETER_NAME=$SUBNET_ID
+        return 0
+    }
+
+    echo "Creating subnet $SUBNET_NAME..."
+    SUBNET_ID=$(
+        aws ec2 create-subnet \
+            --vpc-id $VPC_ID \
+            --availability-zone $AWS_REGION$AZ_LETTER \
+            --cidr-block $CIDR_BLOCK \
+            --query Subnet.SubnetId \
+            --output text
+    )
+    [[ -z $SUBNET_ID ]] && return 1
+    ssm::put $SUBNET_ID_PARAMETER_NAME $SUBNET_ID
+    declare -g $SUBNET_ID_PARAMETER_NAME=$SUBNET_ID
+    vpc::create-name-tag $SUBNET_ID $SUBNET_NAME
+
+    #
+    # ACCESS=private
+    #
+
+    if [[ $ACCESS == private ]]
+    then
+        vpc::create-eip \
+            EIP_ALLOC_ID \
+            $SUBNET_NAME
+
+        vpc::create-nat-gw \
+            NAT_GW_ID \
+            $VPC_NAME-$AZ_LETTER \
+            $VPC_ID \
+            $EIP_ALLOC_ID \
+            $PUBLIC_SUBNET_ID
+
+        vpc::create-route-table \
+            PRIVATE_RTB_ID \
+            $SUBNET_NAME \
+            $VPC_ID \
+            $NAT_GW_ID
+
+        echo "Associating private: route table, subnet $SUBNET_NAME..."
+        aws ec2 associate-route-table \
+            --route-table-id $PRIVATE_RTB_ID \
+            --subnet-id $SUBNET_ID \
+            >/dev/null
+
+    #
+    # ACCESS=public
+    #
+
+    else
+        echo "Associating public: route table, subnet $SUBNET_NAME, ips..."
+        [[ $ACCESS == public ]] || return 1
+
+        aws ec2 associate-route-table \
+            --route-table-id $PUBLIC_RTB_ID \
+            --subnet-id $SUBNET_ID \
+            >/dev/null
+
+        aws ec2 modify-subnet-attribute \
+            --subnet-id $SUBNET_ID \
+            --map-public-ip-on-launch \
+            >/dev/null
+    fi
+}
+
+#
+# vpc
+#
+
+function vpc::create {
+    # Create Virtual Private Cloud for given ENV of the PROJECT
+    # (unless it already exists) with minimal two private and two public subnets
+    # as required by Application Load Balancer, Fargate service, etc
+    #
+    # Usage: vpc::create
+        local VPC_NAME=$PROJECT-$ENV
+
+    echo "Reading VPC $VPC_NAME..."
+    local VPC_ID
+    VPC_ID=$(
+        aws ec2 describe-vpcs \
+            --filters Name=tag:Name,Values=$VPC_NAME \
+            --query Vpcs[].VpcId \
+            --output text
+    )
+    [[ -z $VPC_ID ]] || return 0
+
+    echo "Creating VPC $VPC_NAME..."
+
+    VPC_ID=$(
+        aws ec2 create-vpc \
+            --cidr-block 192.168.0.0/16 \
+            --query Vpc.VpcId \
+            --output text
+        # cidr-block is explained in "subnets" below
+    )
+    [[ -z $VPC_ID ]] && return 1
+    ssm::put VPC_ID $VPC_ID
+    vpc::create-name-tag $VPC_ID $VPC_NAME
+
+    #
+    # IGW and PUBLIC_RTB
+    #
+
+    vpc::create-igw \
+        IGW_ID \
+        $VPC_NAME \
+        $VPC_ID
+
+    vpc::create-route-table \
+        PUBLIC_RTB_ID \
+        $VPC_NAME-public \
+        $VPC_ID \
+        $IGW_ID
+
+    #
+    # subnets
+    #
+
+    # 192.168.000.0/16 - vpc with max allowed block size
+    # 192.168.000.xxx  - 0,1,2,3,255 are reserved by AWS
+    # 192.168.1xx.0/24 - private subnets
+    # 192.168.2xx.0/24 - public subnets
+    #
+    # Private subnet needs NAT GW in a public subnet of the same AZ
+    # (to pull images from the Internet),
+    # so public subnets are created first
+    #
+    # Tabular format of code fits better here to compare subnets
+
+    vpc::create-subnet  PUBLIC_A_SUBNET_ID $VPC_ID $VPC_NAME  public a 192.168.201.0/24 $PUBLIC_RTB_ID
+    vpc::create-subnet  PUBLIC_B_SUBNET_ID $VPC_ID $VPC_NAME  public b 192.168.202.0/24 $PUBLIC_RTB_ID
+
+    # https://www.shellcheck.net/wiki/SC2153
+    # shellcheck disable=SC2153
+    vpc::create-subnet PRIVATE_A_SUBNET_ID $VPC_ID $VPC_NAME private a 192.168.101.0/24 $PUBLIC_A_SUBNET_ID
+    # shellcheck disable=SC2153
+    vpc::create-subnet PRIVATE_B_SUBNET_ID $VPC_ID $VPC_NAME private b 192.168.102.0/24 $PUBLIC_B_SUBNET_ID
+}

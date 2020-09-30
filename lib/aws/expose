@@ -1,0 +1,307 @@
+#!/bin/bash
+set -euf
+IFS=$'\n\t'
+
+# Functions for exposing web services via
+# AWS Load Balancer, API Gateway, Route53
+
+#
+# target group
+#
+
+function expose::create-target-group {
+    # Create or update target group,
+    # put its ARN to SSM parameter
+    # and to a variable with the same name
+    #
+    # Usage: expose::create-target-group \
+        local TARGET_GROUP_ARN_PARAMETER_NAME=$1
+        local TARGET_GROUP_NAME=$2
+        local VPC_ID=$3
+        local PORT=$4
+        local HEALTH_PATH=$5
+
+    echo "Creating or updating target group $TARGET_GROUP_NAME..."
+    # No need to read it first: "create-target-group" is idempotent
+
+    local TARGET_GROUP_ARN
+    TARGET_GROUP_ARN=$(
+        aws elbv2 create-target-group \
+            --name $TARGET_GROUP_NAME \
+            --target-type ip \
+            --protocol HTTP \
+            --port $PORT \
+            --vpc-id $VPC_ID \
+            --health-check-path $HEALTH_PATH \
+            --query TargetGroups[].TargetGroupArn \
+            --output text
+    )
+    [[ -z $TARGET_GROUP_ARN ]] && return 1
+
+    ssm::put $TARGET_GROUP_ARN_PARAMETER_NAME $TARGET_GROUP_ARN
+    declare -g $TARGET_GROUP_ARN_PARAMETER_NAME=$TARGET_GROUP_ARN
+}
+
+#
+# cert
+#
+
+function expose::create-cert-arn {
+    # Create SSL certificate (unless it already exists)
+    # and return its ARN via given variable name
+    #
+    # Usage: expose::create-cert-arn \
+        local CERT_ARN_VAR_NAME=$1
+        local DOMAIN_NAME=$2
+
+    echo "Reading cert for $DOMAIN_NAME..."
+    local CERT_ARN
+    CERT_ARN=$(
+        aws acm list-certificates \
+            --certificate-statuses ISSUED \
+            --query "CertificateSummaryList[?
+                DomainName=='$DOMAIN_NAME'
+            ].CertificateArn" \
+            --output text
+    )
+    [[ -z $CERT_ARN ]] && {
+
+        echo "Creating cert for $DOMAIN_NAME..."
+        CERT_ARN=$(
+            aws acm request-certificate \
+                --domain-name $DOMAIN_NAME \
+                --subject-alternative-names "*.$DOMAIN_NAME" \
+                --idempotency-token $(
+                    echo $DOMAIN_NAME | tr -dc A-Za-z0-9
+                ) \
+                --validation-method DNS \
+                --query CertificateArn \
+                --output text
+        )
+
+        echo "Reading validation of cert for $DOMAIN_NAME..."
+        read -r VALIDATION_NAME VALIDATION_VALUE < <(
+            aws acm describe-certificate \
+                --certificate-arn $CERT_ARN \
+                --query "Certificate.DomainValidationOptions[].ResourceRecord.[Name, Value]" \
+                --output text
+        )
+
+        echo "Validating $VALIDATION_NAME=$VALIDATION_VALUE..."
+        expose::create-domain-record \
+            $VALIDATION_NAME \
+            $VALIDATION_VALUE
+
+        echo "Waiting for validation..."
+        aws acm wait certificate-validated \
+            --certificate-arn $CERT_ARN
+    }
+
+    declare -g $CERT_ARN_VAR_NAME=$CERT_ARN
+}
+
+#
+# LB
+#
+
+function expose::create-lb {
+    # Create Load Balancer (unless it already exists),
+    # put its LB_SECGROUP_ID and TARGET_GROUP_ARN to SSM parameters
+    # and to the variables with the same name
+    #
+    # Usage: expose::create-lb \
+        local LB_SECGROUP_ID_PARAMETER_NAME=$1
+        local TARGET_GROUP_ARN_PARAMETER_NAME=$2
+        local LB_NAME=$3
+        local HEALTH_PATH=$4
+        local PUBLIC_A_SUBNET_ID=$5
+        local PUBLIC_B_SUBNET_ID=$6
+
+    vpc::create-secgroup \
+        $LB_SECGROUP_ID_PARAMETER_NAME \
+        $LB_NAME-lb \
+        $VPC_ID "
+        --protocol tcp
+        --port 443
+        --cidr 0.0.0.0/0"
+
+    local LB_SECGROUP_ID=${!LB_SECGROUP_ID_PARAMETER_NAME}
+
+    expose::create-target-group \
+        $TARGET_GROUP_ARN_PARAMETER_NAME \
+        $LONG_NAME \
+        $VPC_ID \
+        $PORT \
+        $HEALTH_PATH
+
+    local TARGET_GROUP_ARN=${!TARGET_GROUP_ARN_PARAMETER_NAME}
+
+    local PROJECT_DOMAIN_NAME=$PROJECT.$COMPANY_DOMAIN_NAME
+    expose::create-cert-arn CERT_ARN $PROJECT_DOMAIN_NAME
+
+    echo "Reading LB $LB_NAME..."
+    aws elbv2 describe-load-balancers \
+        --names $LB_NAME \
+        &>/dev/null \
+        && return 0
+
+    echo "Creating LB $LB_NAME..."
+    local LB_ARN
+    LB_ARN=$(
+        aws elbv2 create-load-balancer \
+            --name $LB_NAME \
+            --type application \
+            --scheme internet-facing \
+            --subnets $PUBLIC_A_SUBNET_ID $PUBLIC_B_SUBNET_ID \
+            --security-groups $LB_SECGROUP_ID \
+            --query LoadBalancers[].LoadBalancerArn \
+            --output text
+    )
+    [[ -z $LB_ARN ]] && return 1
+
+    echo "Creating LB listener for $LB_NAME..."
+    aws elbv2 create-listener \
+        --load-balancer-arn $LB_ARN \
+        --protocol HTTPS \
+        --port 443 \
+        --ssl-policy ELBSecurityPolicy-2016-08 \
+        --certificates CertificateArn=$CERT_ARN \
+        --default-actions Type=forward,TargetGroupArn=$TARGET_GROUP_ARN \
+        >/dev/null
+}
+
+#
+# LB DNS name
+#
+
+function expose::read-lb-dns-name {
+    # Read DNS name of Load Balancer
+    # and return it via given variable name
+    #
+    # Usage: expose::read-lb-dns-name \
+        local LB_DNS_NAME_VAR_NAME=$1
+        local LB_NAME=$2
+
+    echo "Reading LB DNS name for $LB_NAME..."
+    local LB_DNS_NAME
+    LB_DNS_NAME=$(
+        aws elbv2 describe-load-balancers \
+            --names $LB_NAME \
+            --query LoadBalancers[].DNSName \
+            --output text
+    )
+    [[ -z $LB_DNS_NAME ]] && return 1
+
+    declare -g $LB_DNS_NAME_VAR_NAME=$LB_DNS_NAME
+}
+
+#
+# API GW
+#
+
+function expose::create-api-gw-domain-name {
+    # Create custom domain name (unless it already exists)
+    # in API Gateway ("regional" mode to optimize intra-region latency)
+    # and in Route 53, connecting internal domain name correctly
+    #
+    # Usage: expose::create-api-gw-custom-domain-name \
+        local APP_DOMAIN_NAME=$1
+        local API_NAME=$2  # E.g. $SAM_STACK_NAME
+
+    echo "Reading API GW domain name $APP_DOMAIN_NAME..."
+    aws apigateway get-domain-name \
+        --domain-name $APP_DOMAIN_NAME \
+        &>/dev/null \
+        && return 0
+
+    local PROJECT_DOMAIN_NAME=$PROJECT.$COMPANY_DOMAIN_NAME
+    expose::create-cert-arn CERT_ARN $PROJECT_DOMAIN_NAME
+
+    echo "Creating API GW domain name $APP_DOMAIN_NAME..."
+    local INTERNAL_DOMAIN_NAME
+    INTERNAL_DOMAIN_NAME=$(
+        aws apigateway create-domain-name \
+            --domain-name $APP_DOMAIN_NAME \
+            --endpoint-configuration types=REGIONAL \
+            --regional-certificate-arn $CERT_ARN \
+            --security-policy TLS_1_2 \
+            --query regionalDomainName \
+            --output text
+    )
+
+    # Let's create domain record asap,
+    # because DNS update is slow, we will use this time to configure API GW mapping
+    expose::create-domain-record \
+        $APP_DOMAIN_NAME \
+        $INTERNAL_DOMAIN_NAME
+
+    echo "Reading API GW REST API ID of $API_NAME..."
+    local API_ID
+    API_ID=$(
+        aws apigateway get-rest-apis \
+            --query "items[?
+                name=='$API_NAME'
+            ].id" \
+            --output text
+    )
+
+    echo "Creating API GW mapping from $APP_DOMAIN_NAME to $API_NAME..."
+    aws apigateway create-base-path-mapping \
+        --domain-name $APP_DOMAIN_NAME \
+        --rest-api-id $API_ID \
+        --stage Stage \
+        >/dev/null
+}
+
+#
+# domain-record
+#
+
+function expose::create-domain-record {
+    # Create or update app domain record,
+    # that points to internal domain name
+    #
+    # Usage: expose::create-domain-record \
+        local APP_DOMAIN_NAME=$1
+        local INTERNAL_DOMAIN_NAME=$2
+
+    [[ ${APP_DOMAIN_NAME: -1} == . ]] || {
+        APP_DOMAIN_NAME=$APP_DOMAIN_NAME.
+    }
+
+    echo "Reading zone for $COMPANY_DOMAIN_NAME..."
+    local ZONE_ID
+    ZONE_ID=$(
+        aws route53 list-hosted-zones \
+            --query "HostedZones[?Name=='$COMPANY_DOMAIN_NAME.'].Id" \
+            --output text
+    )
+    [[ -z $ZONE_ID ]] && return 1
+
+    echo "Creating or updating domain record $APP_DOMAIN_NAME..."
+    local CHANGE_ID
+    CHANGE_ID=$(
+        aws route53 change-resource-record-sets \
+            --hosted-zone-id $ZONE_ID \
+            --change-batch "$(cat <<END
+{"Changes": [{
+    "Action": "UPSERT",
+    "ResourceRecordSet": {
+        "Name": "$APP_DOMAIN_NAME",
+        "Type": "CNAME",
+        "TTL": 300,
+        "ResourceRecords": [{
+            "Value": "$INTERNAL_DOMAIN_NAME"
+        }]
+    }
+}]}
+END
+            )" \
+            --query "ChangeInfo.Id" \
+            --output text
+    )
+
+    echo "Waiting for this change..."
+    aws route53 wait resource-record-sets-changed \
+        --id $CHANGE_ID
+}

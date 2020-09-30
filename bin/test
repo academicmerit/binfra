@@ -1,0 +1,23 @@
+#!/bin/bash
+set -euf
+IFS=$'\n\t'
+
+echo "Running shellcheck..."
+
+# Please sync with README.md:"exclude ShellCheck":
+SC_EXCLUDE=SC2046,SC2053,SC2068,SC2086,SC2119
+
+set +f  # Temporary enable globbing
+
+shellcheck \
+    --shell=bash \
+    --severity=style \
+    --exclude=$SC_EXCLUDE \
+    bin/* \
+    lib/aws/* \
+    ;
+
+set -f  # Back to disabled globbing
+
+echo
+echo "Done: $0 $*"

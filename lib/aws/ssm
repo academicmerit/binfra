@@ -1,0 +1,83 @@
+#!/bin/bash
+set -euf
+IFS=$'\n\t'
+
+# Functions for using AWS [Simple] Systems Manager
+# as a *simple* NAME=VALUE storage,
+# scoped to /$PROJECT/$ENV namespace
+
+function ssm::put {
+    # Put NAME=VALUE to SSM
+    #
+    # Usage: ssm::put $NAME $VALUE
+
+    local NAME=/$PROJECT/$ENV/$1
+    echo "Put $NAME"
+
+    aws ssm put-parameter \
+        --overwrite \
+        --type String \
+        --name $NAME \
+        --value "$2" \
+        >/dev/null
+}
+
+function ssm::get {
+    # Return VALUE by NAME from SSM
+    #
+    # Usage: VALUE=$(ssm::get $NAME)
+
+    aws ssm get-parameter \
+        --name /$PROJECT/$ENV/$1 \
+        --query "Parameter.Value" \
+        --output text
+}
+
+function ssm::export {
+    # Export NAME=VALUE pairs from SSM to env vars
+    #
+    # Usage: ssm::export $NAMES
+
+    # NOTE:
+    # Blind export of "aws ssm get-parameters-by-path"
+    # could be exploited to overwrite system vars like $PATH,
+    # so let's request explicit list of vars,
+    # which also avoids complexity of pagination
+    # and makes it obvious where a var referenced after ssm::export came from
+
+    while read -r NAME VALUE
+    do export ${NAME/\/$PROJECT\/$ENV\//}=$VALUE
+    done < <(
+        aws ssm get-parameters \
+            --names $(
+                for NAME in $@
+                do echo /$PROJECT/$ENV/$NAME
+                done
+            ) \
+            --query "Parameters[].[Name, Value]" \
+            --output text
+    )
+}
+
+# https://www.shellcheck.net/wiki/SC2120
+# shellcheck disable=SC2120
+function ssm::rand-str {
+    # Return random alpha-numeric string of given LENGTH
+    #
+    # Usage: VALUE=$(ssm::rand-str $LENGTH)
+    #    or: VALUE=$(ssm::rand-str)
+
+    local DEFAULT_LENGTH=64
+    local LENGTH=${1:-$DEFAULT_LENGTH}
+
+    tr -dc A-Za-z0-9 </dev/urandom | head -c $LENGTH
+    # -dc: delete complementary set == delete all except given set
+}
+
+function ssm::create-random-secrets {
+    echo "Creating or updating random secrets..."
+
+    for SECRET in $@
+    do ssm::put $SECRET $(ssm::rand-str)
+    done
+}

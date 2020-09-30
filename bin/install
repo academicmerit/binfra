@@ -1,0 +1,139 @@
+#!/bin/bash
+set -euf
+IFS=$'\n\t'
+
+# TODO: Please copy this template to your project and tailor it for your needs
+
+#
+# import
+#
+
+# shellcheck source=/dev/null
+. $(command -v import)
+import academicmerit/binfra@0.1.0
+
+#
+# config
+#
+
+# NOTE: If you reuse this config in other scripts,
+# please move it to `config/base`,
+# which may be overridden with `config/local` vs `config/remote`
+
+export AWS_ACCOUNT_ID=509825015935
+export AWS_SOURCE_PROFILE=finetune
+export AWS_PROFILE=${AWS_SOURCE_PROFILE}-dev
+export AWS_REGION=us-east-1
+export AWS_AZ=${AWS_REGION}a
+
+COMPANY_DOMAIN_NAME=finetunelearning.com
+PROJECT=sample
+
+APP=nginx
+IMAGE=nginx
+PORT=80
+HEALTH_PATH=/
+
+ENV_VARS='
+    [
+        {"name": "COLOR", "value": "#FFF"}
+    ]
+'
+
+SECRETS="
+RDS_USER
+RDS_PASS
+RDS_ENDPOINT
+"
+
+ENV=${1:-NONE}
+ENVS="(local|dev|qa|prod)"
+
+[[ $ENV == @$ENVS ]] || {
+    echo "Invalid ENV=$ENV
+
+Usage:
+    bin/install ENV
+
+Install $PROJECT to ENV $ENVS for the first time"
+    exit 1
+}
+
+#
+# ENV=local
+#
+
+if [[ $ENV == local ]]
+then
+    echo "TODO: install local"
+
+#
+# ENV=dev,qa,prod
+#
+
+else
+    ENDPOINT=https://$ENV-$APP.$PROJECT.$COMPANY_DOMAIN_NAME
+    echo "Reading $ENDPOINT..."
+    curl --fail $ENDPOINT &>/dev/null && {
+        echo "Stop! ENV=$ENV already exists!"
+        exit 1
+    }
+
+    import ../lib/aws/profile
+    import ../lib/aws/ssm
+    import ../lib/aws/vpc
+    import ../lib/aws/rds
+    import ../lib/aws/fargate
+    import ../lib/aws/expose
+
+    vpc::create
+    rds::create  # postgres 12.2 by default
+    fargate::create-cluster
+    fargate::create-execution-role
+
+    fargate::create-app $APP \
+        $IMAGE \
+        $PORT \
+        $HEALTH_PATH \
+        "$ENV_VARS" \
+        "$SECRETS"
+
+    #
+    # test
+    #
+
+    echo "You local DNS update may take some time!"
+    echo -n "Testing $ENDPOINT ..."
+    while true
+    do
+        RESPONSE=$(
+            curl $ENDPOINT --silent || true
+        )
+
+        {
+            [[ -z $RESPONSE ]] \
+            || [[ "$RESPONSE" == '{"message":"Forbidden"}' ]]
+        } && {
+            echo -n .
+            sleep 1
+            continue
+        }
+
+        [[ "$RESPONSE" == *"Welcome to nginx"* ]] && {
+            echo
+            echo "Test OK"
+            break
+        }
+
+        echo "Test failed: $RESPONSE"
+        exit 1
+    done
+    echo
+
+#
+# Done
+#
+
+fi
+echo
+echo "Done: $0 $*"

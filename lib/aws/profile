@@ -1,0 +1,53 @@
+#!/bin/bash
+set -euf
+IFS=$'\n\t'
+
+AWS_CREDS=$HOME/.aws/credentials
+AWS_CONFIG=$HOME/.aws/config
+
+AWS_USAGE="Please update these files:
+
+$AWS_CREDS:
+
+[$AWS_SOURCE_PROFILE]
+aws_access_key_id = REDACTED
+aws_secret_access_key = REDACTED
+
+$AWS_CONFIG:
+
+[profile $AWS_PROFILE]
+source_profile = $AWS_SOURCE_PROFILE
+role_arn = arn:aws:iam::$AWS_ACCOUNT_ID:role/AdministratorMFARole
+mfa_serial = arn:aws:iam::$AWS_ACCOUNT_ID:mfa/{your AWS username}
+region = $AWS_REGION
+output = json
+"
+
+{
+    grep -qF "[$AWS_SOURCE_PROFILE]" $AWS_CREDS &&
+    grep -qF "[profile $AWS_PROFILE]" $AWS_CONFIG
+} || {
+    echo "$AWS_USAGE"
+    exit 1
+}
+
+AWS_ACCOUNT_ID_SPECIFIED=$(
+    aws sts get-caller-identity \
+        --query Account \
+        --output text
+)
+
+[[ $AWS_ACCOUNT_ID_SPECIFIED == $AWS_ACCOUNT_ID ]] || {
+    echo "AWS account ID should be $AWS_ACCOUNT_ID, not $AWS_ACCOUNT_ID_SPECIFIED"
+    echo "$AWS_USAGE"
+    exit 1
+}
+
+AWS_REGION_SPECIFIED=$(aws configure get region)
+
+[[ $AWS_REGION_SPECIFIED == $AWS_REGION ]] || {
+    echo "AWS region should be $AWS_REGION, not $AWS_REGION_SPECIFIED"
+    echo "$AWS_USAGE"
+    exit 1
+}
+

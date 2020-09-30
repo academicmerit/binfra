@@ -1,0 +1,316 @@
+#!/bin/bash
+set -euf
+IFS=$'\n\t'
+
+# Functions for Fargate mode of AWS Elastic Container Service
+
+function fargate::can-be-created {
+    # Check if described ECS object can be (re)created
+    #
+    # Usage: fargate::can-be-created $(aws ecs describe-...) && { aws ecs create-... }
+        local OUTPUT="$*"
+
+    [[ $OUTPUT == *'"reason": "MISSING"'* ]] || \
+    [[ $OUTPUT == *'"status": "INACTIVE"'* ]]
+}
+
+#
+# cluster
+#
+
+function fargate::create-cluster {
+    # Create Fargate cluster (unless it already exists),
+    # shared by all projects and envs,
+    # then wait for it to become active
+
+    echo "Reading cluster fargate..."
+    fargate::can-be-created "$(
+        aws ecs describe-clusters --clusters fargate
+    )" && {
+
+        echo "Creating cluster fargate..."
+        aws ecs create-cluster \
+            --cluster-name fargate \
+            --capacity-providers FARGATE \
+            --default-capacity-provider-strategy capacityProvider=FARGATE \
+            >/dev/null
+    }
+
+    echo -n "Waiting cluster fargate..."
+    while ! aws ecs describe-clusters \
+        --clusters fargate \
+        --query "clusters[].status" \
+        --output text \
+        | grep -q '^ACTIVE$'
+    do
+        echo -n .
+        sleep 1
+    done
+    echo
+}
+
+#
+# execution role
+#
+
+EXECUTION_ROLE_NAME=${PROJECT^}ExecutionRole
+
+function fargate::create-execution-role {
+    # Create execution role (unless it already exists)
+    # which gives our ECS tasks access to get our SSM parameters
+    # and access to use resources required by default
+
+    echo "Reading $EXECUTION_ROLE_NAME..."
+    aws iam get-role \
+        --role-name $EXECUTION_ROLE_NAME \
+        &>/dev/null \
+        && return 0
+
+    echo "Creating role $EXECUTION_ROLE_NAME..."
+    aws iam create-role \
+        --role-name $EXECUTION_ROLE_NAME \
+        --assume-role-policy-document "$(cat <<END
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Principal": {
+                "Service": "ecs-tasks.amazonaws.com"
+            },
+            "Action": "sts:AssumeRole"
+        }
+    ]
+}
+END
+        )" >/dev/null
+
+    echo "Attaching managed policy to $EXECUTION_ROLE_NAME..."
+    aws iam attach-role-policy \
+      --role-name $EXECUTION_ROLE_NAME \
+      --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy \
+      >/dev/null
+
+    echo "Attaching custom policy to $EXECUTION_ROLE_NAME..."
+    aws iam put-role-policy \
+      --role-name $EXECUTION_ROLE_NAME \
+      --policy-name ${EXECUTION_ROLE_NAME}Policy \
+      --policy-document "$(cat <<END
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": "ssm:GetParameters",
+            "Resource": "arn:aws:ssm:$AWS_REGION:$AWS_ACCOUNT_ID:parameter/$PROJECT/*"
+        }
+    ]
+}
+END
+    )" >/dev/null
+}
+
+#
+# log group
+#
+
+function fargate::create-log-group {
+    # Create log group (unless it already exists)
+    #
+    # Usage: fargate::create-log-group \
+        local LOG_GROUP_NAME=$1
+
+    echo "Reading log group $LOG_GROUP_NAME..."
+    local NUMBER_OF_GROUPS
+    NUMBER_OF_GROUPS=$(
+        aws logs describe-log-groups \
+            --log-group-name-prefix $LOG_GROUP_NAME \
+            --query "length(logGroups)" \
+            --output text
+    )
+    [[ $NUMBER_OF_GROUPS == 0 ]] || return 0
+
+    echo "Creating log group $LOG_GROUP_NAME..."
+    aws logs create-log-group \
+        --log-group-name $LOG_GROUP_NAME \
+        > /dev/null
+}
+
+#
+# task definition
+#
+
+CONTAINER_NAME=main  # To keep it simple, one container per task for now
+
+function fargate::create-task-definition {
+    # Create or update minimal task definition for Fargate,
+    # it can be scaled on demand later
+    #
+    # Usage: fargate::create-task-definition \
+        local TASK_NAME=$1
+        local IMAGE=$2
+        local PORT=$3
+        local ENV_VARS=$4  # [{"name": "$NAME", "value": "$VALUE"},..]
+        local SECRETS=$5  # "NAME1 NAME2 NAME3..."
+
+    local SECRETS_JSON
+    SECRETS_JSON=$(
+        for SECRET in $SECRETS
+        do echo "{\"name\": \"$SECRET\", \"valueFrom\": \"/$PROJECT/$ENV/$SECRET\"},"
+        done
+    )
+
+    local LOG_GROUP_NAME=$TASK_NAME
+    fargate::create-log-group $LOG_GROUP_NAME
+
+    echo "Creating or updating task definition $TASK_NAME..."
+    aws ecs register-task-definition \
+        --cli-input-json "$(cat <<END
+{
+    "family": "$TASK_NAME",
+    "executionRoleArn": "arn:aws:iam::$AWS_ACCOUNT_ID:role/$EXECUTION_ROLE_NAME",
+    "requiresCompatibilities": ["FARGATE"],
+    "networkMode": "awsvpc",
+    "cpu": "256",
+    "memory": "512",
+    "containerDefinitions": [
+        {
+            "name": "$CONTAINER_NAME",
+            "image": "$IMAGE",
+            "portMappings": [{"containerPort": $PORT}],
+            "environment" : $ENV_VARS,
+            "secrets": [${SECRETS_JSON::-1}],
+            "logConfiguration": {
+                "logDriver": "awslogs",
+                "options": {
+                    "awslogs-group": "$LOG_GROUP_NAME",
+                    "awslogs-region": "$AWS_REGION",
+                    "awslogs-stream-prefix": "$TASK_NAME"
+                }
+            }
+        }
+    ]
+}
+END
+        )" >/dev/null
+}
+
+#
+# service
+#
+
+function fargate::create-service {
+    # Create minimal Fargate service (unless it already exists)
+    # that keeps defined task running,
+    # it can be scaled on demand later
+    #
+    # Usage: fargate::create-service \
+        local SERVICE_NAME=$1
+        local TASK_NAME=$2
+        local CONTAINER_SECGROUP_ID=$3
+        local TARGET_GROUP_ARN=$4
+        local PORT=$5
+        local PRIVATE_A_SUBNET_ID=$6
+        local PRIVATE_B_SUBNET_ID=$7
+
+    echo "Reading service $SERVICE_NAME..."
+    fargate::can-be-created "$(
+        aws ecs describe-services \
+            --cluster fargate \
+            --services $SERVICE_NAME
+    )" || return 0
+
+    echo "Creating service $SERVICE_NAME..."
+    aws ecs create-service \
+        --cluster fargate \
+        --launch-type FARGATE \
+        --service-name $SERVICE_NAME \
+        --task-definition $TASK_NAME \
+        --desired-count 1 \
+        --network-configuration "awsvpcConfiguration={
+            subnets=[$PRIVATE_A_SUBNET_ID, $PRIVATE_B_SUBNET_ID],
+            securityGroups=[$CONTAINER_SECGROUP_ID]
+        }" \
+        --load-balancers \
+            "targetGroupArn=$TARGET_GROUP_ARN,
+            containerName=$CONTAINER_NAME,
+            containerPort=$PORT
+        " \
+        >/dev/null
+}
+
+#
+# app
+#
+
+function fargate::create-app {
+    # Create task definition and service in Fargate cluster,
+    # grant access to our RDS,
+    # expose this service
+    #
+    # Usage: fargate::create-app \
+        local SHORT_NAME=$1
+        local IMAGE=$2
+        local PORT=$3
+        local HEALTH_PATH=$4
+        local ENV_VARS="$5"
+        local SECRETS="$6"
+        # Please see `fargate::create-task-definition` docs for ENV_VARS and SECRETS
+
+    local LONG_NAME=$PROJECT-$ENV-$SHORT_NAME
+
+    echo "Reading config..."
+    ssm::export \
+        VPC_ID \
+        PRIVATE_A_SUBNET_ID \
+        PRIVATE_B_SUBNET_ID \
+        PUBLIC_A_SUBNET_ID \
+        PUBLIC_B_SUBNET_ID \
+        RDS_SECGROUP_ID
+
+    local TASK_NAME=$LONG_NAME
+    fargate::create-task-definition \
+        $TASK_NAME \
+        $IMAGE \
+        $PORT \
+        "$ENV_VARS" \
+        "$SECRETS"
+
+    local LB_NAME=$LONG_NAME
+    expose::create-lb \
+        LB_SECGROUP_ID \
+        TARGET_GROUP_ARN \
+        $LB_NAME \
+        $HEALTH_PATH \
+        $PUBLIC_A_SUBNET_ID \
+        $PUBLIC_B_SUBNET_ID
+
+    vpc::create-secgroup \
+        CONTAINER_SECGROUP_ID \
+        $LONG_NAME-container \
+        $VPC_ID "
+        --protocol tcp
+        --port $PORT
+        --source-group $LB_SECGROUP_ID"
+
+    vpc::create-inbound-rule-between-secgroups \
+        $RDS_SECGROUP_ID \
+        $CONTAINER_SECGROUP_ID \
+        5432
+
+    fargate::create-service \
+        $LONG_NAME \
+        $TASK_NAME \
+        $CONTAINER_SECGROUP_ID \
+        $TARGET_GROUP_ARN \
+        $PORT \
+        $PRIVATE_A_SUBNET_ID \
+        $PRIVATE_B_SUBNET_ID
+
+    local APP_DOMAIN_NAME=$ENV-$SHORT_NAME.$PROJECT.$COMPANY_DOMAIN_NAME
+    expose::read-lb-dns-name LB_DNS_NAME $LB_NAME
+
+    expose::create-domain-record \
+        $APP_DOMAIN_NAME \
+        $LB_DNS_NAME
+}
