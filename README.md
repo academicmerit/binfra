@@ -1,6 +1,6 @@
 # binfra
 
-Bash infrastructure lib with concise functions:
+bash infrastructure lib with concise functions:
 
 ```
 # NAME=VALUE ...
@@ -100,7 +100,7 @@ Please:
 * https://console.aws.amazon.com/cloudwatch/home?region=us-east-1#logsV2:log-groups
     * `[x] Exact match`
 
-## Bash
+## bash
 
 * To avoid bash issues, we will use the next tools and ideas
 * [Bash Strict Mode](http://redsymbol.net/articles/unofficial-bash-strict-mode/)
@@ -152,4 +152,3 @@ Please:
   even when it breaks natural bash style, just like `shfmt` does above
     * However, we adopt some good ideas like separating lib names with `::`
       to make it clear which lib the function belongs to
-* To avoid import loops, we import `lib`-s in `bin` entrypoints only

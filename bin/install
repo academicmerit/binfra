@@ -10,7 +10,7 @@ IFS=$'\n\t'
 
 # shellcheck source=/dev/null
 . $(command -v import)
-import academicmerit/binfra@0.1.0
+import academicmerit/binfra@0.1.1
 
 #
 # config
@@ -79,13 +79,7 @@ else
         exit 1
     }
 
-    import ../lib/aws/profile
-    import ../lib/aws/ssm
-    import ../lib/aws/vpc
-    import ../lib/aws/rds
-    import ../lib/aws/fargate
-    import ../lib/aws/expose
-
+    aws_profile::validate
     vpc::create
     rds::create  # postgres 12.2 by default
     fargate::create-cluster
