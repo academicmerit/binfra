@@ -10,7 +10,7 @@ IFS=$'\n\t'
 
 # shellcheck source=/dev/null
 . $(command -v import)
-import academicmerit/binfra@0.1.2
+import academicmerit/binfra@0.1.3
 
 #
 # config

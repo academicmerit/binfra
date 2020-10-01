@@ -53,12 +53,14 @@ function fargate::create-cluster {
 # execution role
 #
 
-EXECUTION_ROLE_NAME=${PROJECT^}ExecutionRole
-
 function fargate::create-execution-role {
     # Create execution role (unless it already exists)
     # which gives our ECS tasks access to get our SSM parameters
     # and access to use resources required by default
+
+    local EXECUTION_ROLE_NAME
+    EXECUTION_ROLE_NAME=${PROJECT^}ExecutionRole
+    ssm::put EXECUTION_ROLE_NAME $EXECUTION_ROLE_NAME
 
     echo "Reading $EXECUTION_ROLE_NAME..."
     aws iam get-role \
@@ -162,6 +164,8 @@ function fargate::create-task-definition {
 
     local LOG_GROUP_NAME=$TASK_NAME
     fargate::create-log-group $LOG_GROUP_NAME
+
+    ssm::export EXECUTION_ROLE_NAME
 
     echo "Creating or updating task definition $TASK_NAME..."
     aws ecs register-task-definition \
