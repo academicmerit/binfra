@@ -9,7 +9,6 @@ function rds::create {
     # (unless it already exists)
     #
     # Usage: rds::create \
-        # shellcheck disable=SC2120
         local RDS_ENGINE=${1:-postgres}
         local RDS_ENGINE_VERSION=${2:-12.2}
         local RDS_ID=$PROJECT-$ENV

@@ -64,6 +64,9 @@ snap install --channel=edge shellcheck || {
 ```
 
 Please:
+* Make sure `aws` command is available in your project,  
+  e.g. add `awscli` to `requirements-local.txt` of your project  
+  and `pip install -r requirements-local.txt`
 * Copy [bin/install](bin/install?raw=true) template to your project
 * Update `bin/install` with your project-specific values
 * `chmod a+x bin/install`
