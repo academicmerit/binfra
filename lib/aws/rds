@@ -10,7 +10,7 @@ function rds::create {
     #
     # Usage: rds::create \
         local RDS_ENGINE=${1:-postgres}
-        local RDS_ENGINE_VERSION=${2:-12.2}
+        local RDS_ENGINE_VERSION=${2:-12.8}
         local RDS_ID=$PROJECT-$ENV
         
 
